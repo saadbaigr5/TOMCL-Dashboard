@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+secrets/
+DB_TOMCL/*.db
+DB_TOMCL/*.db-*
+*.db
