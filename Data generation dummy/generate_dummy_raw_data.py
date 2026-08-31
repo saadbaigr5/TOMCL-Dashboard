@@ -33,7 +33,7 @@ DB_PATH = PACKAGE_ROOT / "DB_TOMCL" / "DB_Tomcl.db"
 SEED_MARKER = SCRIPT_DIR / ".raw_chiller_seed_done"
 
 sys.path.insert(0, str(PACKAGE_ROOT / "tomcl_python"))
-from chiller_rooms import disperse_new_raw_rows, disperse_raw_row, list_chiller_rooms  # noqa: E402
+from chiller_rooms import disperse_new_raw_rows, disperse_raw_row, list_chiller_rooms, write_lock_held  # noqa: E402
 
 # Pakistan Standard Time (matches sample timestamps)
 TZ = timezone(timedelta(hours=5))
@@ -385,22 +385,35 @@ def last_raw_for(conn: sqlite3.Connection, chiller_id: str) -> dict[str, Any] | 
     return dict(row) if row else None
 
 
-def live_loop(conn: sqlite3.Connection, names: list[str], interval: float) -> None:
+def live_loop(names: list[str], interval: float) -> None:
     log(f"live mode: poll every {interval:g}s — insert only when data changes (Ctrl+C to stop)")
     rng = random.Random()
     states: dict[str, dict[str, Any]] = {}
     seq = 0
 
     for name in names:
-        prev = last_raw_for(conn, name)
+        conn = connect()
+        try:
+            prev = last_raw_for(conn, name)
+        finally:
+            conn.close()
         if prev:
             states[name] = prev
 
     while True:
+        if write_lock_held():
+            time.sleep(0.5)
+            continue
         now = datetime.now(TZ)
         for name in names:
             seq += 1
-            prev = states.get(name) or last_raw_for(conn, name)
+            prev = states.get(name)
+            if prev is None:
+                conn = connect()
+                try:
+                    prev = last_raw_for(conn, name)
+                finally:
+                    conn.close()
             reading = make_unique_reading(
                 when=now,
                 chiller_id=name,
@@ -419,6 +432,10 @@ def live_loop(conn: sqlite3.Connection, names: list[str], interval: float) -> No
 
             if raw_changed(reading, prev):
                 for attempt in range(8):
+                    if write_lock_held():
+                        time.sleep(0.5)
+                        break
+                    conn = connect()
                     try:
                         cur = conn.execute(INSERT_SQL, row_tuple(reading))
                         new_id = int(cur.lastrowid or 0)
@@ -436,6 +453,8 @@ def live_loop(conn: sqlite3.Connection, names: list[str], interval: float) -> No
                         if "locked" not in str(exc).lower():
                             raise
                         time.sleep(0.25 * (attempt + 1))
+                    finally:
+                        conn.close()
                 else:
                     log(f"DB locked — skipped push for {name!r}")
             else:
@@ -463,6 +482,7 @@ def main() -> int:
         return 1
 
     conn = connect()
+    names: list[str] = []
     try:
         ensure_table(conn)
         names = chiller_names(conn)
@@ -486,16 +506,19 @@ def main() -> int:
         if args.once:
             log("done (--once)")
             return 0
-
-        if not list_chiller_rooms():
-            log("WARNING: no rooms in chiller_rooms — create Chiller 1/2 in Admin so disperse can work")
-
-        live_loop(conn, names, args.interval)
     except KeyboardInterrupt:
         log("stopped by user")
         return 0
     finally:
         conn.close()
+
+    if not list_chiller_rooms():
+        log("WARNING: no rooms in chiller_rooms — create Chiller 1/2 in Admin so disperse can work")
+
+    try:
+        live_loop(names, args.interval)
+    except KeyboardInterrupt:
+        log("stopped by user")
     return 0
 
 
