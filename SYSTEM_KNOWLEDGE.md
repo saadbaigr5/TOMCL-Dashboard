@@ -622,7 +622,7 @@ python reveal_admin_password.py
 | Subtables empty but raw has data | Fetcher not running or ID mismatch | Run fetcher; ensure `chiller_id` in raw matches room `name` |
 | `database is locked` | DB Browser open or long admin write | Close DB Browser; wait 2s; retry |
 | Admin delete hangs | SQLite lock contention | Fixed: non-blocking delete + write lock |
-| API unreachable in fetcher logs | Simulator off at `192.168.0.123:5000` | Normal — fetcher continues from existing raw data |
+| API unreachable in fetcher logs | Device/gateway off at `192.168.0.50` | Normal — fetcher continues dispersing existing raw data |
 | Charts empty for today | No subtable rows for selected date | Pick a date that has data in `_temp` / `_humidity` |
 | Slow admin page load | Was calling repair on every page view | Removed auto-repair on page load |
 
