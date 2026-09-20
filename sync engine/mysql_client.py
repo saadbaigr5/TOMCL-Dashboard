@@ -98,6 +98,29 @@ def ensure_mysql_tables(conn: Connection) -> None:
         except Exception:
             pass
 
+        try:
+            cur.execute(
+                "ALTER TABLE `chiller_rooms` ADD COLUMN `chiller_active` VARCHAR(32) NULL"
+            )
+        except Exception:
+            pass
+
+        # Prefer one row per room name / prefix on Hostinger (stops create duplication).
+        try:
+            cur.execute(
+                "ALTER TABLE `chiller_rooms` "
+                "ADD UNIQUE KEY `uq_chiller_rooms_name` (`name`)"
+            )
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                "ALTER TABLE `chiller_rooms` "
+                "ADD UNIQUE KEY `uq_chiller_rooms_prefix` (`table_prefix`)"
+            )
+        except Exception:
+            pass
+
         # Cloud change feed used for reliable both-way pull of updates/deletes.
         cur.execute(
             """

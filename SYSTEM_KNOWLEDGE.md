@@ -162,6 +162,7 @@ A **chiller room** is a registered cold-storage unit in the system (e.g. `"Chill
    - `{prefix}_temp`
    - `{prefix}_humidity`
    - `{prefix}_door_status`
+  - `{prefix}_defrost`
 
 The **table prefix** is derived from the name: `"Chiller 1"` → `Chiller_1`.
 
@@ -173,6 +174,7 @@ The **table prefix** is derived from the name: `"Chiller 1"` → `Chiller_1`.
 | **`{prefix}_temp`** | Normalized temperature history (one row per change) |
 | **`{prefix}_humidity`** | Normalized humidity history (one row per change) |
 | **`{prefix}_door_status`** | Door events (unlock row → lock row + duration) |
+| **`{prefix}_defrost`** | Defrost cycles (ON row → OFF row + duration) |
 
 The fetcher always tries to **distribute from raw into subtables**, even when the API is offline.
 
@@ -199,7 +201,7 @@ All chiller data must live in **`DB_TOMCL/DB_Tomcl.db`**. There is no separate r
 Browser → POST /device-config/create-room (or /chiller-rooms)
        → register_chiller_room("Chiller 1")
        → INSERT chiller_rooms
-       → CREATE Chiller_1_temp, Chiller_1_humidity, Chiller_1_door_status
+       → CREATE Chiller_1_temp, Chiller_1_humidity, Chiller_1_door_status, Chiller_1_defrost
 ```
 
 ### Step 2 — Fetcher polls (every 2 seconds)
@@ -288,6 +290,14 @@ Stores full API snapshots. Key columns:
 | `time_stamp_locked` | When door closed (NULL while open) |
 | `duration` | How long door was open |
 
+**`{prefix}_defrost`**
+
+| Column | Description |
+|--------|-------------|
+| `time_stamp_defrost_ON` | When defrost started |
+| `time_stamp_defrost_OFF` | When defrost ended (NULL while active) |
+| `duration` | How long defrost ran |
+
 ### 6.4 Relationships (logical)
 
 ```
@@ -295,6 +305,7 @@ chiller_rooms (1) ──► (N) raw_chiller_data     [match by chiller_id / name
 chiller_rooms (1) ──► (1) {prefix}_temp
 chiller_rooms (1) ──► (1) {prefix}_humidity
 chiller_rooms (1) ──► (1) {prefix}_door_status
+chiller_rooms (1) ──► (1) {prefix}_defrost
 ```
 
 SQLite does not enforce foreign keys; matching is by naming convention and string IDs.
@@ -531,6 +542,7 @@ Door normalization:
 | Chiller room registry | SQLite `chiller_rooms` | Yes |
 | Temperature / humidity history | SQLite subtables | Yes |
 | Door event history | SQLite `{prefix}_door_status` | Yes |
+| Defrost cycle history | SQLite `{prefix}_defrost` | Yes |
 | Raw API readings | SQLite `raw_chiller_data` | Yes |
 | Overview card temp/hum/door | `latest_live_metrics()` | Live read |
 | Analytics charts | `telemetry_from_subtables()` | Live read |
@@ -553,7 +565,7 @@ Door normalization:
 ### `repair_chiller_tables.py`
 
 - Ensures schema exists.
-- Creates missing `{prefix}_temp`, `_humidity`, `_door_status` for all registered rooms.
+- Creates missing `{prefix}_temp`, `_humidity`, `_door_status`, `_defrost` for all registered rooms.
 - Run when subtables are missing after room creation failed due to DB lock.
 
 ### `reveal_admin_password.py`
@@ -635,7 +647,7 @@ python reveal_admin_password.py
 | **Chiller room** | A registered cold storage unit in the system |
 | **Table prefix** | Slug used to name subtables (e.g. `Chiller_1`) |
 | **Raw data** | Full API snapshot rows in `raw_chiller_data` |
-| **Subtable** | Per-chiller normalized table (`_temp`, `_humidity`, `_door_status`) |
+| **Subtable** | Per-chiller normalized table (`_temp`, `_humidity`, `_door_status`, `_defrost`) |
 | **Change-only write** | Insert/update only when a value actually changes |
 | **Fetcher** | `fetch_chiller_data.py` background poller |
 | **Operational mode** | Day-to-day monitoring role (no admin password) |

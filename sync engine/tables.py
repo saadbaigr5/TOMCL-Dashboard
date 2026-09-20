@@ -7,6 +7,8 @@ from typing import Any
 # direction: "both" | "push" (SQLite -> Hostinger only) | "pull"
 TABLE_MAP: dict[str, dict[str, Any]] = {
     "chiller_rooms": {
+        # Both ways: local dashboard <-> Hostinger web.
+        # Dedicated sync mirrors creates/deletes; subtables live on local SQLite only.
         "direction": "both",
         "pk": "id",
         "columns": [
@@ -29,6 +31,10 @@ TABLE_MAP: dict[str, dict[str, Any]] = {
             "chiller_IP": "VARCHAR(64)",
             "chiller_active": "VARCHAR(32)",
         },
+        # Upsert local→Hostinger every cycle; do NOT delete Hostinger-only rows here
+        # (those are web creates — handled by pull mirror).
+        "reconcile": True,
+        "custom_pull": True,
     },
     "destinations": {
         "direction": "both",

@@ -6,7 +6,8 @@ Bidirectional sync between local SQLite (`DB_TOMCL/DB_Tomcl.db`) and Hostinger M
 
 | Local / Hostinger | Direction |
 |-------------------|-----------|
-| chiller_rooms | Both ways |
+| chiller_rooms | Both ways. Delete wins (tombstones). |
+| `{prefix}_temp/_humidity/_door_status/_defrost` | Both ways (Option A). Created/dropped with the room; rows synced by id watermark. |
 | destinations | Both ways |
 | orders | Both ways |
 | packing_types | Both ways |

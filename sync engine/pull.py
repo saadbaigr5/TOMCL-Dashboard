@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from typing import Any
 
 from mysql_client import fetch_all_rows, fetch_rows_after_pk, fetch_sync_changes
@@ -67,6 +68,23 @@ def apply_row_locally(
         elif k.lower() in local_lower:
             mapped[local_lower[k.lower()]] = v
 
+    # Hostinger rows are sometimes incomplete (NULL created_at / name).
+    # Fill local NOT NULL columns so pull does not wedge forever.
+    if operation != "DELETE":
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        defaults = {
+            "created_at": now,
+            "name": f"Room {row.get(pk)}",
+            "table_prefix": f"Room_{row.get(pk)}",
+        }
+        for col, default in defaults.items():
+            local_name = local_lower.get(col.lower())
+            if not local_name:
+                continue
+            cur = mapped.get(local_name)
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                mapped[local_name] = default
+
     pk_val = row.get(pk)
     if pk_val is None and operation == "DELETE":
         # Allow delete by uuid suffix only when payload empty.
@@ -115,6 +133,9 @@ def apply_row_locally(
         )
     try:
         sqlite_conn.execute(sql, [mapped[c] for c in cols])
+    except sqlite3.IntegrityError:
+        # Name/table_prefix unique clash with a different local id — skip Hostinger orphan.
+        raise
     except sqlite3.OperationalError:
         sqlite_conn.execute(
             f"INSERT OR REPLACE INTO {_qi_sqlite(table_name)} ({col_sql}) VALUES ({placeholders})",
@@ -173,9 +194,64 @@ def pull_from_sync_changes(
                             payload[pk] = raw_pk
                     else:
                         payload[pk] = raw_pk
-            uuid = apply_row_locally(
-                sqlite_conn, table_name, payload, operation=operation
-            )
+
+            # chiller_rooms: create/drop local subtables with the registry row
+            if table_name == "chiller_rooms":
+                from chiller_rooms_sync import apply_chiller_rooms_change
+
+                try:
+                    uuid = apply_chiller_rooms_change(
+                        sqlite_conn,
+                        operation=operation,
+                        payload=payload,
+                        record_uuid_value=str(ch.get("record_uuid") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Unique clashes — skip and advance so watermark is not stuck
+                    if isinstance(exc, sqlite3.IntegrityError):
+                        write_log(
+                            sqlite_conn,
+                            direction="RECEIVED",
+                            table_name=table_name,
+                            record_uuid_value=str(ch.get("record_uuid") or ""),
+                            operation=operation,
+                            sync_status="SKIPPED",
+                            error_message=str(exc)[:1000],
+                        )
+                        skipped += 1
+                        max_seen = max(max_seen, change_id)
+                        continue
+                    raise
+                write_log(
+                    sqlite_conn,
+                    direction="RECEIVED",
+                    table_name=table_name,
+                    record_uuid_value=uuid,
+                    operation=operation,
+                    sync_status="SUCCESS",
+                )
+                received += 1
+                max_seen = max(max_seen, change_id)
+                continue
+
+            try:
+                uuid = apply_row_locally(
+                    sqlite_conn, table_name, payload, operation=operation
+                )
+            except sqlite3.IntegrityError as exc:
+                # Skip Hostinger orphans that clash with local unique name/prefix.
+                write_log(
+                    sqlite_conn,
+                    direction="RECEIVED",
+                    table_name=table_name,
+                    record_uuid_value=str(ch.get("record_uuid") or ""),
+                    operation=operation,
+                    sync_status="SKIPPED",
+                    error_message=str(exc)[:1000],
+                )
+                skipped += 1
+                max_seen = max(max_seen, change_id)
+                continue
             write_log(
                 sqlite_conn,
                 direction="RECEIVED",
@@ -305,6 +381,9 @@ def pull_all(
         )
     }
     for table_name in pull_tables():
+        meta = TABLE_MAP.get(table_name) or {}
+        if meta.get("custom_pull"):
+            continue
         summary[table_name] = pull_table(
             sqlite_conn, mysql_conn, table_name, batch_size=batch_size
         )

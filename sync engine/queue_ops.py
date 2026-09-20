@@ -49,6 +49,34 @@ def enqueue_change(
         """,
         (table_name, uuid),
     )
+
+    # Intentional create of this id clears any old tombstone (new room).
+    if table_name == "chiller_rooms" and op == "INSERT":
+        try:
+            stones = get_json_state(conn, "__chiller_rooms_tombstones__", default=[]) or []
+            sid = int(pk_value)
+            if sid in {int(x) for x in stones}:
+                set_json_state(
+                    conn,
+                    "__chiller_rooms_tombstones__",
+                    sorted(int(x) for x in stones if int(x) != sid),
+                )
+        except Exception:
+            pass
+
+    # Delete-wins: never let pull/reconcile restore this room id.
+    if table_name == "chiller_rooms" and op == "DELETE":
+        try:
+            from chiller_rooms_sync import add_tombstone, cancel_outbound_room_upserts
+
+            prefix = None
+            if data and isinstance(data, dict):
+                prefix = data.get("table_prefix") or data.get("table_Prefix")
+            add_tombstone(conn, int(pk_value), prefix=str(prefix) if prefix else None)
+            cancel_outbound_room_upserts(conn, int(pk_value))
+        except Exception:
+            pass
+
     cur = conn.execute(
         """
         INSERT INTO sync_queue (
@@ -108,4 +136,30 @@ def set_metadata(conn: sqlite3.Connection, table_name: str, last_change_id: int)
             last_sync_at = excluded.last_sync_at
         """,
         (table_name, int(last_change_id), _now()),
+    )
+
+
+def get_json_state(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    row = conn.execute(
+        "SELECT last_sync_at FROM sync_metadata WHERE table_name = ?",
+        (key,),
+    ).fetchone()
+    if not row or not row["last_sync_at"]:
+        return default
+    try:
+        return json.loads(str(row["last_sync_at"]))
+    except Exception:
+        return default
+
+
+def set_json_state(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    payload = json.dumps(value, default=str)
+    conn.execute(
+        """
+        INSERT INTO sync_metadata (table_name, last_change_id, last_sync_at)
+        VALUES (?, 0, ?)
+        ON CONFLICT(table_name) DO UPDATE SET
+            last_sync_at = excluded.last_sync_at
+        """,
+        (key, payload),
     )

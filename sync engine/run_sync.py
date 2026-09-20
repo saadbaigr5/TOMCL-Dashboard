@@ -144,6 +144,10 @@ def main() -> int:
                 print(
                     f"[{time.strftime('%H:%M:%S')}] "
                     f"queue synced={q.get('synced', 0)} failed={q.get('failed', 0)} | "
+                    f"rooms pull +{summary.get('chiller_rooms_pull', {}).get('created', 0)}/"
+                    f"-{summary.get('chiller_rooms_pull', {}).get('deleted_local', 0)} "
+                    f"sub +{summary.get('chiller_subtables', {}).get('pushed_rows', 0)}/"
+                    f"{summary.get('chiller_subtables', {}).get('pulled_rows', 0)} | "
                     f"raw synced={r.get('synced', 0)} failed={r.get('failed', 0)}"
                 )
             except Exception as exc:  # noqa: BLE001

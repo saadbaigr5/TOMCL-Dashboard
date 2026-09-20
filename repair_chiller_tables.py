@@ -30,7 +30,7 @@ if __name__ == "__main__":
     rooms = list_chiller_rooms()
     print(f"Rooms in DB_Tomcl.db: {len(rooms)}")
     for room in rooms:
-        print(f"  - {room['name']} -> {room['table_prefix']}_temp/_humidity/_door_status")
+        print(f"  - {room['name']} -> {room['table_prefix']}_temp/_humidity/_door_status/_defrost")
     print("Creating missing tables ...")
     created = ensure_all_room_tables()
     for name in sorted(set(created)):

@@ -33,12 +33,15 @@ def _pk_from_uuid(table_name: str, uuid: str) -> Any:
 
 
 def process_queue(sqlite_conn: sqlite3.Connection, mysql_conn: Any, *, limit: int = 100) -> dict[str, int]:
+    # Prefer DELETEs first so local room deletes hit Hostinger before any upsert.
     rows = sqlite_conn.execute(
         """
         SELECT * FROM sync_queue
         WHERE status IN ('PENDING', 'FAILED')
           AND retry_count < 8
-        ORDER BY id ASC
+        ORDER BY
+          CASE WHEN UPPER(operation) = 'DELETE' THEN 0 ELSE 1 END,
+          id ASC
         LIMIT ?
         """,
         (limit,),
@@ -46,6 +49,7 @@ def process_queue(sqlite_conn: sqlite3.Connection, mysql_conn: Any, *, limit: in
 
     ok = 0
     fail = 0
+    skipped = 0
     for row in rows:
         qid = int(row["id"])
         table_name = str(row["table_name"])
@@ -65,8 +69,94 @@ def process_queue(sqlite_conn: sqlite3.Connection, mysql_conn: Any, *, limit: in
             if TABLE_MAP[table_name]["direction"] not in ("both", "push"):
                 raise RuntimeError(f"Table {table_name} is not push-enabled")
             if operation == "DELETE":
+                if table_name == "chiller_rooms":
+                    from chiller_rooms_sync import (
+                        add_tombstone,
+                        cancel_outbound_room_upserts,
+                        tombstone_prefix,
+                    )
+                    from chiller_subtables import (
+                        clear_subtable_watermarks,
+                        drop_mysql_chiller_subtables,
+                    )
+
+                    pk_val = _pk_from_uuid(table_name, uuid)
+                    payload_preview = {}
+                    try:
+                        payload_preview = json.loads(row["data"] or "{}") or {}
+                    except Exception:
+                        payload_preview = {}
+                    prefix = (
+                        payload_preview.get("table_prefix")
+                        or tombstone_prefix(sqlite_conn, int(pk_val))
+                    )
+                    add_tombstone(
+                        sqlite_conn,
+                        int(pk_val),
+                        prefix=str(prefix) if prefix else None,
+                    )
+                    cancel_outbound_room_upserts(sqlite_conn, int(pk_val))
+                    if prefix:
+                        try:
+                            drop_mysql_chiller_subtables(mysql_conn, str(prefix))
+                            clear_subtable_watermarks(sqlite_conn, str(prefix))
+                        except Exception:
+                            pass
                 delete_row(mysql_conn, table_name, _pk_from_uuid(table_name, uuid))
             else:
+                # Never recreate a chiller room that was deleted (tombstone) or missing locally.
+                if table_name == "chiller_rooms":
+                    from chiller_rooms_sync import get_tombstones
+
+                    pk_val = _pk_from_uuid(table_name, uuid)
+                    if int(pk_val) in get_tombstones(sqlite_conn):
+                        sqlite_conn.execute(
+                            """
+                            UPDATE sync_queue
+                            SET status = 'SUPERSEDED',
+                                error_message = 'Skipped upsert: room id is tombstoned (deleted)'
+                            WHERE id = ?
+                            """,
+                            (qid,),
+                        )
+                        write_log(
+                            sqlite_conn,
+                            direction="SENT",
+                            table_name=table_name,
+                            record_uuid_value=uuid,
+                            operation=operation,
+                            sync_status="SKIPPED",
+                            error_message="Tombstoned room — not recreating on Hostinger",
+                        )
+                        skipped += 1
+                        ok += 1
+                        continue
+                    exists = sqlite_conn.execute(
+                        "SELECT 1 FROM chiller_rooms WHERE id = ? LIMIT 1",
+                        (pk_val,),
+                    ).fetchone()
+                    if exists is None:
+                        sqlite_conn.execute(
+                            """
+                            UPDATE sync_queue
+                            SET status = 'SUPERSEDED',
+                                error_message = 'Skipped upsert: chiller room not in local DB'
+                            WHERE id = ?
+                            """,
+                            (qid,),
+                        )
+                        write_log(
+                            sqlite_conn,
+                            direction="SENT",
+                            table_name=table_name,
+                            record_uuid_value=uuid,
+                            operation=operation,
+                            sync_status="SKIPPED",
+                            error_message="Room missing locally — not recreating on Hostinger",
+                        )
+                        skipped += 1
+                        ok += 1
+                        continue
                 payload = json.loads(row["data"] or "{}")
                 if not isinstance(payload, dict):
                     raise RuntimeError("Queue data must be a JSON object")
@@ -103,7 +193,7 @@ def process_queue(sqlite_conn: sqlite3.Connection, mysql_conn: Any, *, limit: in
                 error_message=msg,
             )
             fail += 1
-    return {"synced": ok, "failed": fail, "processed": len(rows)}
+    return {"synced": ok, "failed": fail, "skipped": skipped, "processed": len(rows)}
 
 
 def push_raw_chiller_data(
@@ -246,3 +336,84 @@ def repair_raw_chiller_ids(
         "last_id": last_id,
         "remote_rows": remote_n,
     }
+
+
+def reconcile_chiller_rooms(
+    sqlite_conn: sqlite3.Connection,
+    mysql_conn: Any,
+) -> dict[str, int]:
+    """Push every live local room to Hostinger; purge tombstoned ids from Hostinger."""
+    meta = TABLE_MAP.get("chiller_rooms")
+    if not meta or not meta.get("reconcile"):
+        return {"upserted": 0, "skipped": 1}
+
+    from chiller_rooms_sync import get_tombstones
+
+    tombstones = get_tombstones(sqlite_conn)
+    cols = list(meta["columns"])
+    local_rows = sqlite_conn.execute("SELECT * FROM chiller_rooms ORDER BY id").fetchall()
+    upserted = 0
+    purged = 0
+
+    for rid in sorted(tombstones):
+        try:
+            delete_row(mysql_conn, "chiller_rooms", rid)
+            purged += 1
+            write_log(
+                sqlite_conn,
+                direction="SENT",
+                table_name="chiller_rooms",
+                record_uuid_value=record_uuid("chiller_rooms", rid),
+                operation="TOMBSTONE_DELETE",
+                sync_status="SUCCESS",
+            )
+        except Exception:
+            pass
+
+    for row in local_rows:
+        data = {k: row[k] for k in row.keys()}
+        rid = int(data["id"])
+        if rid in tombstones:
+            continue
+        payload: dict[str, Any] = {}
+        lower = {str(k).lower(): v for k, v in data.items()}
+        for c in cols:
+            if c in data:
+                payload[c] = data[c]
+            elif c.lower() in lower:
+                payload[c] = lower[c.lower()]
+            else:
+                payload[c] = None
+        name = str(payload.get("name") or "").strip()
+        prefix = str(payload.get("table_prefix") or "").strip()
+        with mysql_conn.cursor() as cur:
+            if name:
+                cur.execute(
+                    "DELETE FROM `chiller_rooms` WHERE `name` = %s AND `id` <> %s",
+                    (name, rid),
+                )
+            if prefix:
+                cur.execute(
+                    "DELETE FROM `chiller_rooms` WHERE `table_prefix` = %s AND `id` <> %s",
+                    (prefix, rid),
+                )
+        upsert_row(mysql_conn, "chiller_rooms", payload)
+        prefix = str(payload.get("table_prefix") or "").strip()
+        if prefix:
+            try:
+                from chiller_subtables import ensure_mysql_chiller_subtables
+
+                ensure_mysql_chiller_subtables(mysql_conn, prefix)
+            except Exception:
+                pass
+        write_log(
+            sqlite_conn,
+            direction="SENT",
+            table_name="chiller_rooms",
+            record_uuid_value=record_uuid("chiller_rooms", rid),
+            operation="RECONCILE",
+            sync_status="SUCCESS",
+        )
+        upserted += 1
+
+    return {"upserted": upserted, "purged_tombstones": purged, "local": upserted}
